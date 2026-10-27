@@ -20,6 +20,8 @@ import (
 	"github.com/grafov/m3u8"
 )
 
+const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
 type Segment struct {
 	URL string
 	Seq uint64
@@ -38,7 +40,7 @@ var (
 
 func main() {
 	log.SetOutput(os.Stdout)
-	log.Println("Starting go-stream-capturer (stall-protected version)...")
+	log.Println("Starting go-stream-capturer (redirect-ready version)...")
 
 	m3uURL := flag.String("url", "", "m3u8 url")
 	minutes := flag.Int("minutes", 0, "recording minutes")
@@ -82,11 +84,12 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*minutes)*time.Minute)
 	defer cancel()
 
-	resolvedURL, err := resolveMaster(*m3uURL)
+	// リダイレクトおよびMasterプレイリストを完全解決
+	resolvedURL, err := resolvePlaylist(*m3uURL)
 	if err != nil {
-		log.Fatalf("Failed to resolve master playlist: %v", err)
+		log.Fatalf("Failed to resolve target playlist: %v", err)
 	}
-	log.Printf("Resolved Media Playlist URL: %s\n", resolvedURL)
+	log.Printf("Final Resolved Media Playlist URL: %s\n", resolvedURL)
 
 	taskChan := make(chan *Segment, 100)
 	resultChan := make(chan *Downloaded, 100)
@@ -95,7 +98,7 @@ func main() {
 	var wg sync.WaitGroup
 
 	wg.Add(1)
-	go monitorPlaylist(ctx, &wg, resolvedURL, taskChan, firstSeqChan)
+	go monitorPlaylist(ctx, &wg, *m3uURL, resolvedURL, taskChan, firstSeqChan)
 
 	for i := 0; i < 6; i++ {
 		wg.Add(1)
@@ -109,44 +112,75 @@ func main() {
 	log.Println("Recording successfully finished and all files are processed.")
 }
 
-func resolveMaster(playlistURL string) (string, error) {
-	client := &http.Client{Timeout: 15 * time.Second}
-	req, err := http.NewRequest("GET", playlistURL, nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	p, listType, err := m3u8.DecodeFrom(resp.Body, true)
-	if err != nil {
-		return "", err
+// リダイレクトの追跡とマスタープレイリストの解決を行う関数
+func resolvePlaylist(rawURL string) (string, error) {
+	currentURL := rawURL
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+		},
 	}
 
-	if listType == m3u8.MASTER {
-		master := p.(*m3u8.MasterPlaylist)
-		var maxBW uint32
-		var bestURI string
-		for _, v := range master.Variants {
-			if v.VariantParams.Bandwidth > maxBW {
-				maxBW = v.VariantParams.Bandwidth
-				bestURI = v.URI
+	for depth := 0; depth < 5; depth++ {
+		req, err := http.NewRequest("GET", currentURL, nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("User-Agent", defaultUserAgent)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", err
+		}
+
+		// 【重要】リダイレクト後の最終着地URLを取得
+		finalURL := resp.Request.URL
+
+		p, listType, err := m3u8.DecodeFrom(resp.Body, true)
+		resp.Body.Close()
+		if err != nil {
+			return "", fmt.Errorf("failed to decode m3u8 from %s: %w", finalURL.String(), err)
+		}
+
+		if listType == m3u8.MASTER {
+			master := p.(*m3u8.MasterPlaylist)
+			var maxBW uint32
+			var bestURI string
+			for _, v := range master.Variants {
+				if v.VariantParams.Bandwidth > maxBW {
+					maxBW = v.VariantParams.Bandwidth
+					bestURI = v.URI
+				}
 			}
+			if bestURI == "" && len(master.Variants) > 0 {
+				bestURI = master.Variants[0].URI
+			}
+			if bestURI == "" {
+				return finalURL.String(), nil
+			}
+
+			u, err := url.Parse(bestURI)
+			if err != nil {
+				return "", err
+			}
+			// 【重要】リダイレクト後の finalURL をベースに相対パスを解決
+			nextURL := finalURL.ResolveReference(u).String()
+			log.Printf("[Resolver] Master playlist detected at %s. Selected variant (%d bps): %s\n", finalURL.String(), maxBW, nextURL)
+			currentURL = nextURL
+			continue
+		} else if listType == m3u8.MEDIA {
+			log.Printf("[Resolver] Media playlist found: %s\n", finalURL.String())
+			return finalURL.String(), nil
 		}
-		if bestURI == "" {
-			return playlistURL, nil
-		}
-		base, _ := url.Parse(playlistURL)
-		u, _ := url.Parse(bestURI)
-		return base.ResolveReference(u).String(), nil
+
+		return finalURL.String(), nil
 	}
-	return playlistURL, nil
+
+	return currentURL, nil
 }
 
-func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string, taskChan chan<- *Segment, firstSeqChan chan<- uint64) {
+func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, origURL, initialPlaylistURL string, taskChan chan<- *Segment, firstSeqChan chan<- uint64) {
 	defer wg.Done()
 	client := &http.Client{
 		Timeout: 15 * time.Second,
@@ -155,29 +189,45 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 		},
 	}
 
+	playlistURL := initialPlaylistURL
 	seen := make(map[uint64]bool)
 	var mu sync.Mutex
 	first := true
+	consecutiveErrors := 0
 
 	fetchAndProcess := func() {
 		req, err := http.NewRequestWithContext(ctx, "GET", playlistURL, nil)
 		if err != nil {
 			return
 		}
+		req.Header.Set("User-Agent", defaultUserAgent)
 		resp, err := client.Do(req)
 		if err != nil {
 			log.Printf("[Monitor] Playlist fetch failed: %v\n", err)
+			consecutiveErrors++
+			// リダイレクト元URLからセッションを再取得（自動修復）
+			if consecutiveErrors >= 5 && origURL != playlistURL {
+				log.Printf("[Monitor] Attempting to refresh playlist from original URL: %s\n", origURL)
+				if refreshed, rErr := resolvePlaylist(origURL); rErr == nil {
+					playlistURL = refreshed
+					consecutiveErrors = 0
+					log.Printf("[Monitor] Playlist refreshed to: %s\n", playlistURL)
+				}
+			}
 			return
 		}
+
+		// リダイレクト後のURLを常にBaseURLとして使用
+		baseURL := resp.Request.URL
 
 		p, listType, err := m3u8.DecodeFrom(resp.Body, true)
 		resp.Body.Close()
 		if err != nil || listType != m3u8.MEDIA {
 			return
 		}
+		consecutiveErrors = 0
 
 		media := p.(*m3u8.MediaPlaylist)
-		baseURL, _ := url.Parse(playlistURL)
 
 		// fMP4 INIT取得
 		if media.Map != nil {
@@ -188,6 +238,7 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 				mapURL = mURL
 				log.Printf("[Monitor] Found EXT-X-MAP: %s\n", mURL)
 				reqMap, _ := http.NewRequestWithContext(ctx, "GET", mURL, nil)
+				reqMap.Header.Set("User-Agent", defaultUserAgent)
 				respMap, err := client.Do(reqMap)
 				if err == nil && respMap.StatusCode == 200 {
 					data, _ := io.ReadAll(respMap.Body)
@@ -208,7 +259,6 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 		var minSeq uint64 = math.MaxUint64
 		var found bool
 
-		// HLS標準仕様に準拠した正確なシーケンス計算
 		baseSeq := media.SeqNo
 		for i, seg := range media.Segments {
 			if seg == nil {
@@ -280,7 +330,7 @@ func downloader(ctx context.Context, wg *sync.WaitGroup, workerID int, taskChan 
 }
 
 func downloadWithRetry(ctx context.Context, client *http.Client, targetURL string) []byte {
-	maxRetries := 5 // 最大5回で諦めて無限停止を防ぐ
+	maxRetries := 5
 	retryCount := 0
 	for retryCount < maxRetries {
 		select {
@@ -290,6 +340,7 @@ func downloadWithRetry(ctx context.Context, client *http.Client, targetURL strin
 		}
 		req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
 		if err == nil {
+			req.Header.Set("User-Agent", defaultUserAgent)
 			resp, err := client.Do(req)
 			if err == nil {
 				if resp.StatusCode == 200 {
@@ -419,10 +470,8 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 		return nil
 	}
 
-	// 欠落検知とバッファ書き込みの安全な進行
 	flushBuffer := func() {
 		for {
-			// 連番セグメントが存在する場合は順次書き込む
 			if data, ok := buffer[nextSeq]; ok {
 				if len(data) > 0 {
 					if err := checkRotation(); err == nil {
@@ -434,7 +483,6 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 				continue
 			}
 
-			// 連番が途切れているが、バッファに未来のセグメントが10個以上溜まっている場合（欠落・ストール検知）
 			if len(buffer) >= 10 {
 				var keys []uint64
 				for k := range buffer {
@@ -474,7 +522,6 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 				continue
 			}
 
-			// CMやDiscontinuityでシーケンス番号が0や大幅に小さい値にリセットされた場合の対応
 			if res.Seq < nextSeq {
 				if nextSeq > 1000 && res.Seq < 100 {
 					log.Printf("[Writer] Stream discontinuity reset detected (Seq %d -> %d). Resetting nextSeq.\n", nextSeq, res.Seq)
