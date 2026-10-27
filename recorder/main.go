@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"sort"
 	"sync"
 	"time"
 
@@ -29,7 +30,6 @@ type Downloaded struct {
 	Data []byte
 }
 
-// fMP4 INIT用
 var (
 	mapMu   sync.Mutex
 	mapData []byte
@@ -38,7 +38,7 @@ var (
 
 func main() {
 	log.SetOutput(os.Stdout)
-	log.Println("Starting go-stream-capturer (fixed fMP4 & precision-0s version)...")
+	log.Println("Starting go-stream-capturer (stall-protected version)...")
 
 	m3uURL := flag.String("url", "", "m3u8 url")
 	minutes := flag.Int("minutes", 0, "recording minutes")
@@ -60,7 +60,7 @@ func main() {
 		log.Printf("Scheduled Start Time (JST): %s\n", *startStr)
 	}
 
-	// === 開始時間までの待機処理（00秒ちょうどに補正して待機） ===
+	// === 開始時間までの待機処理（00秒ちょうど） ===
 	if *startStr != "" {
 		loc := time.FixedZone("JST", 9*60*60)
 		startTime, err := time.ParseInLocation("2006-01-02 15:04", *startStr, loc)
@@ -79,7 +79,6 @@ func main() {
 		}
 	}
 
-	// 録画時間（minutes）のカウントダウン開始
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*minutes)*time.Minute)
 	defer cancel()
 
@@ -180,7 +179,7 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 		media := p.(*m3u8.MediaPlaylist)
 		baseURL, _ := url.Parse(playlistURL)
 
-		// === fMP4対応: EXT-X-MAP取得 (初回のみ) ===
+		// fMP4 INIT取得
 		if media.Map != nil {
 			mapMu.Lock()
 			if mapData == nil {
@@ -188,7 +187,6 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 				mURL := baseURL.ResolveReference(u).String()
 				mapURL = mURL
 				log.Printf("[Monitor] Found EXT-X-MAP: %s\n", mURL)
-				// INIT取得
 				reqMap, _ := http.NewRequestWithContext(ctx, "GET", mURL, nil)
 				respMap, err := client.Do(reqMap)
 				if err == nil && respMap.StatusCode == 200 {
@@ -200,7 +198,7 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 					if respMap != nil {
 						respMap.Body.Close()
 					}
-					log.Printf("[Monitor] Failed to fetch MAP")
+					log.Printf("[Monitor] Failed to fetch MAP\n")
 				}
 			}
 			mapMu.Unlock()
@@ -210,11 +208,13 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 		var minSeq uint64 = math.MaxUint64
 		var found bool
 
-		for _, seg := range media.Segments {
+		// HLS標準仕様に準拠した正確なシーケンス計算
+		baseSeq := media.SeqNo
+		for i, seg := range media.Segments {
 			if seg == nil {
 				continue
 			}
-			seq := media.SeqNo + seg.SeqId
+			seq := baseSeq + uint64(i)
 			if !seen[seq] {
 				seen[seq] = true
 				u, _ := url.Parse(seg.URI)
@@ -237,9 +237,7 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 		mu.Unlock()
 	}
 
-	// 待機完了後の0秒時点にディレイ無しで初回取得を実行
 	fetchAndProcess()
-
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -256,7 +254,7 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 
 func downloader(ctx context.Context, wg *sync.WaitGroup, workerID int, taskChan <-chan *Segment, resultChan chan<- *Downloaded) {
 	defer wg.Done()
-	client := &http.Client{Timeout: 45 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second}
 	for {
 		select {
 		case <-ctx.Done():
@@ -282,9 +280,9 @@ func downloader(ctx context.Context, wg *sync.WaitGroup, workerID int, taskChan 
 }
 
 func downloadWithRetry(ctx context.Context, client *http.Client, targetURL string) []byte {
+	maxRetries := 5 // 最大5回で諦めて無限停止を防ぐ
 	retryCount := 0
-	notFoundCount := 0
-	for {
+	for retryCount < maxRetries {
 		select {
 		case <-ctx.Done():
 			return nil
@@ -300,31 +298,36 @@ func downloadWithRetry(ctx context.Context, client *http.Client, targetURL strin
 					if err == nil {
 						return data
 					}
-				} else if resp.StatusCode == 404 || resp.StatusCode == 410 {
-					resp.Body.Close()
-					notFoundCount++
-					if notFoundCount >= 3 {
-						return nil
-					}
 				} else {
 					resp.Body.Close()
+					if resp.StatusCode == 404 || resp.StatusCode == 410 {
+						if retryCount >= 2 {
+							return nil
+						}
+					}
 				}
 			}
 		}
+
 		retryCount++
-		delay := float64(2) * math.Pow(2, float64(retryCount-1))
-		if delay > 30 {
-			delay = 30
+		if retryCount >= maxRetries {
+			break
 		}
-		jitter := rand.Float64() * 3
+
+		delay := float64(2) * math.Pow(2, float64(retryCount-1))
+		if delay > 15 {
+			delay = 15
+		}
+		jitter := rand.Float64() * 2
 		sleepDur := time.Duration((delay + jitter) * float64(time.Second))
-		log.Printf("[Retry] Waiting %v to retry...\n", sleepDur)
+		log.Printf("[Retry] Waiting %v to retry downloading...\n", sleepDur)
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-time.After(sleepDur):
 		}
 	}
+	return nil
 }
 
 func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Downloaded, firstSeqChan <-chan uint64, outPrefix string, splitSec int, tag string) {
@@ -393,7 +396,7 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 			mapMu.Unlock()
 			ext := "ts"
 			if isFMP4 {
-				ext = "mp4" // fMP4はmp4拡張子が正しい
+				ext = "mp4"
 			}
 			currentFilename = fmt.Sprintf("%s-%03d.%s", outPrefix, currentFileIdx, ext)
 			f, err := os.Create(currentFilename)
@@ -406,7 +409,6 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 			fileOpenTime = time.Now()
 			log.Printf("[Writer] Created new file: %s\n", currentFilename)
 
-			// fMP4なら先頭にINIT（EXT-X-MAP）データを結合
 			mapMu.Lock()
 			if len(mapData) > 0 {
 				f.Write(mapData)
@@ -417,6 +419,41 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 		return nil
 	}
 
+	// 欠落検知とバッファ書き込みの安全な進行
+	flushBuffer := func() {
+		for {
+			// 連番セグメントが存在する場合は順次書き込む
+			if data, ok := buffer[nextSeq]; ok {
+				if len(data) > 0 {
+					if err := checkRotation(); err == nil {
+						currentFile.Write(data)
+					}
+				}
+				delete(buffer, nextSeq)
+				nextSeq++
+				continue
+			}
+
+			// 連番が途切れているが、バッファに未来のセグメントが10個以上溜まっている場合（欠落・ストール検知）
+			if len(buffer) >= 10 {
+				var keys []uint64
+				for k := range buffer {
+					if k > nextSeq {
+						keys = append(keys, k)
+					}
+				}
+				if len(keys) > 0 {
+					sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+					minFutureSeq := keys[0]
+					log.Printf("[Writer] Sequence gap detected! Skipping missing segments from %d to %d\n", nextSeq, minFutureSeq)
+					nextSeq = minFutureSeq
+					continue
+				}
+			}
+			break
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -424,45 +461,32 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 		case seq := <-firstSeqChan:
 			nextSeq = seq
 			firstSeqSet = true
-			for {
-				if data, ok := buffer[nextSeq]; ok {
-					if len(data) > 0 {
-						if err := checkRotation(); err == nil {
-							currentFile.Write(data)
-						}
-					}
-					delete(buffer, nextSeq)
-					nextSeq++
-				} else {
-					break
-				}
-			}
+			log.Printf("[Writer] Initialized nextSeq to %d\n", nextSeq)
+			flushBuffer()
 		case res := <-resultChan:
 			data := res.Data
 			if data == nil {
 				data = []byte{}
 			}
-			if firstSeqSet {
-				if res.Seq < nextSeq {
+
+			if !firstSeqSet {
+				buffer[res.Seq] = data
+				continue
+			}
+
+			// CMやDiscontinuityでシーケンス番号が0や大幅に小さい値にリセットされた場合の対応
+			if res.Seq < nextSeq {
+				if nextSeq > 1000 && res.Seq < 100 {
+					log.Printf("[Writer] Stream discontinuity reset detected (Seq %d -> %d). Resetting nextSeq.\n", nextSeq, res.Seq)
+					nextSeq = res.Seq
+					buffer = make(map[uint64][]byte)
+				} else {
 					continue
 				}
-				buffer[res.Seq] = data
-				for {
-					if d, ok := buffer[nextSeq]; ok {
-						if len(d) > 0 {
-							if err := checkRotation(); err == nil {
-								currentFile.Write(d)
-							}
-						}
-						delete(buffer, nextSeq)
-						nextSeq++
-					} else {
-						break
-					}
-				}
-			} else {
-				buffer[res.Seq] = data
 			}
+
+			buffer[res.Seq] = data
+			flushBuffer()
 		}
 	}
 }
